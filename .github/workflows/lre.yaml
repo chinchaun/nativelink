@@ -82,6 +82,8 @@ jobs:
         with:
             backtrace: full
             logger: pretty
+            extra-conf: |
+              filter-syscalls = false
       # - name: Free disk space
       #   uses: >- # v2.0.0
       #     endersonmenezes/free-disk-space@3f9ec39ebae520864ac93467ee395f5237585c21
