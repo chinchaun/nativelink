@@ -3,12 +3,12 @@ name: "CodeQL"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "fake" ]
   pull_request:
-    branches: [ "main" ]
-  schedule:
-    # Non-peak hour 1:21 AM on Saturdays.
-    - cron: '21 1 * * 6'
+    branches: [ "fake" ]
+  # schedule:
+  #   # Non-peak hour 1:21 AM on Saturdays.
+  #   - cron: '21 1 * * 6'
 
 permissions: read-all
 

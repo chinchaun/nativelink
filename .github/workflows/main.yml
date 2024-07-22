@@ -3,11 +3,9 @@ name: CI
 # Controls when the workflow will run.
 on:
   push:
-    branches: [ main ]
+    branches: [ "fake" ]
   pull_request:
-    branches: [ main ]
-    paths-ignore:
-      - 'docs/**'
+    branches: [ "fake" ]
 
 permissions: read-all
 

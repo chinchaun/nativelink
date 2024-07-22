@@ -1,12 +1,10 @@
 ---
 name: Create OCI image
 on:
-  pull_request:
-    branches:
-      - main
   push:
-    branches:
-      - main
+    branches: [ "fake" ]
+  pull_request:
+    branches: [ "fake" ]
 
 permissions: read-all
 

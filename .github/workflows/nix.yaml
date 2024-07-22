@@ -3,9 +3,9 @@ name: Nix
 
 on:
   push:
-    branches: [main]
+    branches: [ "fake" ]
   pull_request:
-    branches: [main]
+    branches: [ "fake" ]
 
 permissions: read-all
 

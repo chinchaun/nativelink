@@ -1,11 +1,11 @@
 ---
 name: Scorecard supply-chain security
 on:
-  schedule:
-    # Non-peak hour 23:15 on Tuesdays.
-    - cron: '15 23 * * 1'
+  # schedule:
+  #   # Non-peak hour 23:15 on Tuesdays.
+  #   - cron: '15 23 * * 1'
   push:
-    branches: [ "main" ]
+    branches: [ "fake" ]
 
 permissions: read-all
 

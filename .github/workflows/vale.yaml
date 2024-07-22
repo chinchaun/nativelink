@@ -1,7 +1,12 @@
 ---
 name: Vale
 
-on: [pull_request]
+# on: [pull_request]
+on:
+  push:
+    branches: [ "fake" ]
+  pull_request:
+    branches: [ "fake" ]
 
 permissions: read-all
 
