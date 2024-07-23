@@ -96,6 +96,10 @@ jobs:
       - name: Cache Nix derivations
         uses: >- # v4
           DeterminateSystems/magic-nix-cache-action@fc6aaceb40b9845a02b91e059ec147e78d1b4e41
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          sudo: false
 
       - name: Go version
         shell: bash
