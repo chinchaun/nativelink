@@ -97,6 +97,9 @@ jobs:
         uses: >- # v4
           DeterminateSystems/magic-nix-cache-action@fc6aaceb40b9845a02b91e059ec147e78d1b4e41
 
+      - name: Go version
+        run: go version
+
       - name: Start Kubernetes cluster (Infra)
         run: >
           nix run .#native up
