@@ -3,9 +3,9 @@ name: Local Remote Execution
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "test" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "test" ]
   workflow_dispatch:
     inputs:
       logLevel:
@@ -108,7 +108,7 @@ jobs:
 
       - name: Start Kubernetes cluster (Infra)
         run: >
-          nix run .#native up
+          nix run .#native up --debug
 
       - name: Start Kubernetes cluster (Operations)
         run: >
