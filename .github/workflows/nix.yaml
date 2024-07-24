@@ -3,9 +3,9 @@ name: Nix
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 permissions: read-all
 
@@ -106,7 +106,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [open-fire-ubuntu-22-04-8vcpu-x86_64]
+        os: [open-fire-ubuntu-22-04-4vcpu-aarch64]
+        # os: [open-fire-ubuntu-22-04-8vcpu-x86_64]
     name: Installation / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
