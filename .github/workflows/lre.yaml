@@ -99,7 +99,7 @@ jobs:
 
       - name: Start Kubernetes cluster (Infra)
         run: >
-          nix run .#native up --debug
+          nix run .#native up
 
       - name: Start Kubernetes cluster (Operations)
         run: >
