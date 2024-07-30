@@ -14,6 +14,7 @@
 
 pub mod action_messages;
 pub mod buf_channel;
+pub mod channel_body_for_tests;
 pub mod chunked_stream;
 pub mod common;
 pub mod connection_manager;
@@ -23,6 +24,7 @@ pub mod evicting_map;
 pub mod fastcdc;
 pub mod fs;
 pub mod health_utils;
+pub mod instant_wrapper;
 pub mod metrics_utils;
 pub mod operation_state_manager;
 pub mod origin_context;

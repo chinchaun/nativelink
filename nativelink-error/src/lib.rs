@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use nativelink_metric::{
+    MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
+};
 use prost_types::TimestampError;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +48,16 @@ macro_rules! error_if {
 pub struct Error {
     pub code: Code,
     pub messages: Vec<String>,
+}
+
+impl MetricsComponent for Error {
+    fn publish(
+        &self,
+        kind: MetricKind,
+        field_metadata: MetricFieldData,
+    ) -> Result<MetricPublishKnownKindData, nativelink_metric::Error> {
+        self.to_string().publish(kind, field_metadata)
+    }
 }
 
 impl Error {
@@ -142,6 +155,12 @@ impl From<prost::DecodeError> for Error {
 
 impl From<prost::EncodeError> for Error {
     fn from(err: prost::EncodeError) -> Self {
+        make_err!(Code::Internal, "{}", err.to_string())
+    }
+}
+
+impl From<prost::UnknownEnumValue> for Error {
+    fn from(err: prost::UnknownEnumValue) -> Self {
         make_err!(Code::Internal, "{}", err.to_string())
     }
 }
@@ -439,5 +458,19 @@ impl From<Code> for std::io::ErrorKind {
             Code::Unavailable => Self::ConnectionRefused,
             _ => Self::Other,
         }
+    }
+}
+
+// Allows for mapping this type into a generic serialization error.
+impl serde::ser::Error for Error {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        Self::new(Code::InvalidArgument, msg.to_string())
+    }
+}
+
+// Allows for mapping this type into a generic deserialization error.
+impl serde::de::Error for Error {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        Self::new(Code::InvalidArgument, msg.to_string())
     }
 }

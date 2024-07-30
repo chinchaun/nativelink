@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -19,11 +20,12 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use nativelink_config::stores::{EvictionPolicy, ExistenceCacheStore as ExistenceCacheStoreConfig};
 use nativelink_error::{error_if, Error, ResultExt};
+use nativelink_metric::MetricsComponent;
 use nativelink_util::buf_channel::{DropCloserReadHalf, DropCloserWriteHalf};
 use nativelink_util::common::DigestInfo;
 use nativelink_util::evicting_map::{EvictingMap, LenEntry};
-use nativelink_util::health_utils::{default_health_status_indicator, HealthStatusIndicator};
-use nativelink_util::metrics_utils::{CollectorState, MetricsComponent, Registry};
+use nativelink_util::health_utils::{HealthStatus, HealthStatusIndicator};
+use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::store_trait::{Store, StoreDriver, StoreKey, StoreLike, UploadSizeInfo};
 
 #[derive(Clone, Debug)]
@@ -41,23 +43,39 @@ impl LenEntry for ExistanceItem {
     }
 }
 
-pub struct ExistenceCacheStore {
+#[derive(MetricsComponent)]
+pub struct ExistenceCacheStore<I: InstantWrapper> {
+    #[metric(group = "inner_store")]
     inner_store: Store,
-    existence_cache: EvictingMap<DigestInfo, ExistanceItem, SystemTime>,
+    existence_cache: EvictingMap<DigestInfo, ExistanceItem, I>,
 }
 
-impl ExistenceCacheStore {
+impl ExistenceCacheStore<SystemTime> {
     pub fn new(config: &ExistenceCacheStoreConfig, inner_store: Store) -> Arc<Self> {
+        Self::new_with_time(config, inner_store, SystemTime::now())
+    }
+}
+
+impl<I: InstantWrapper> ExistenceCacheStore<I> {
+    pub fn new_with_time(
+        config: &ExistenceCacheStoreConfig,
+        inner_store: Store,
+        anchor_time: I,
+    ) -> Arc<Self> {
         let empty_policy = EvictionPolicy::default();
         let eviction_policy = config.eviction_policy.as_ref().unwrap_or(&empty_policy);
         Arc::new(Self {
             inner_store,
-            existence_cache: EvictingMap::new(eviction_policy, SystemTime::now()),
+            existence_cache: EvictingMap::new(eviction_policy, anchor_time),
         })
     }
 
     pub async fn exists_in_cache(&self, digest: &DigestInfo) -> bool {
-        self.existence_cache.size_for_key(digest).await.is_some()
+        let mut results = [None];
+        self.existence_cache
+            .sizes_for_keys([digest], &mut results[..], true /* peek */)
+            .await;
+        results[0].is_some()
     }
 
     pub async fn remove_from_cache(&self, digest: &DigestInfo) {
@@ -69,7 +87,9 @@ impl ExistenceCacheStore {
         keys: &[DigestInfo],
         results: &mut [Option<usize>],
     ) -> Result<(), Error> {
-        self.existence_cache.sizes_for_keys(keys, results).await;
+        self.existence_cache
+            .sizes_for_keys(keys, results, true /* peek */)
+            .await;
 
         let not_cached_keys: Vec<_> = keys
             .iter()
@@ -127,7 +147,7 @@ impl ExistenceCacheStore {
 }
 
 #[async_trait]
-impl StoreDriver for ExistenceCacheStore {
+impl<I: InstantWrapper> StoreDriver for ExistenceCacheStore<I> {
     async fn has_with_results(
         self: Pin<&Self>,
         digests: &[StoreKey<'_>],
@@ -210,17 +230,15 @@ impl StoreDriver for ExistenceCacheStore {
     fn as_any_arc(self: Arc<Self>) -> Arc<dyn std::any::Any + Sync + Send + 'static> {
         self
     }
-
-    fn register_metrics(self: Arc<Self>, registry: &mut Registry) {
-        let inner_store_registry = registry.sub_registry_with_prefix("inner_store");
-        self.inner_store.register_metrics(inner_store_registry);
-    }
 }
 
-impl MetricsComponent for ExistenceCacheStore {
-    fn gather_metrics(&self, c: &mut CollectorState) {
-        self.existence_cache.gather_metrics(c)
+#[async_trait]
+impl<I: InstantWrapper> HealthStatusIndicator for ExistenceCacheStore<I> {
+    fn get_name(&self) -> &'static str {
+        "ExistenceCacheStore"
+    }
+
+    async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
+        StoreDriver::check_health(Pin::new(self), namespace).await
     }
 }
-
-default_health_status_indicator!(ExistenceCacheStore);

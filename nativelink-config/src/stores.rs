@@ -712,7 +712,8 @@ pub struct EvictionPolicy {
     #[serde(default, deserialize_with = "convert_data_size_with_shellexpand")]
     pub evict_bytes: usize,
 
-    /// Maximum number of seconds for an entry to live before an eviction.
+    /// Maximum number of seconds for an entry to live since it was last
+    /// accessed before it is evicted.
     /// Default: 0. Zero means never evict based on time.
     #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
     pub max_seconds: u32,
@@ -741,6 +742,20 @@ pub struct S3Store {
     /// Retry configuration to use when a network request fails.
     #[serde(default)]
     pub retry: Retry,
+
+    /// If the number of seconds since the `last_modified` time of the object
+    /// is greater than this value, the object will not be considered
+    /// "existing". This allows for external tools to delete objects that
+    /// have not been uploaded in a long time. If a client receives a NotFound
+    /// the client should re-upload the object.
+    ///
+    /// There should be sufficient buffer time between how long the expiration
+    /// configuration of the external tool is and this value. Keeping items
+    /// around for a few days is generally a good idea.
+    ///
+    /// Default: 0. Zero means never consider an object expired.
+    #[serde(default, deserialize_with = "convert_duration_with_shellexpand")]
+    pub consider_expired_after_s: u32,
 
     /// The maximum buffer size to retain in case of a retryable error
     /// during upload. Setting this to zero will disable upload buffering;

@@ -20,44 +20,21 @@ use std::future::Future;
 use std::hash::Hash;
 use std::ops::{DerefMut, RangeBounds};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_lock::Mutex;
 use lru::LruCache;
 use nativelink_config::stores::EvictionPolicy;
+use nativelink_metric::MetricsComponent;
 use serde::{Deserialize, Serialize};
 use tracing::{event, Level};
 
-use crate::metrics_utils::{CollectorState, Counter, CounterWithTime, MetricsComponent};
+use crate::instant_wrapper::InstantWrapper;
+use crate::metrics_utils::{Counter, CounterWithTime};
 
 #[derive(Serialize, Deserialize, PartialEq, Debug, Clone)]
 pub struct SerializedLRU<K> {
     pub data: Vec<(K, i32)>,
     pub anchor_time: u64,
-}
-
-/// Wrapper used to abstract away which underlying Instant impl we are using.
-/// This is needed for testing.
-pub trait InstantWrapper: 'static {
-    fn from_secs(secs: u64) -> Self;
-    fn unix_timestamp(&self) -> u64;
-    fn elapsed(&self) -> Duration;
-}
-
-impl InstantWrapper for SystemTime {
-    fn from_secs(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH
-            .checked_add(Duration::from_secs(secs))
-            .unwrap()
-    }
-
-    fn unix_timestamp(&self) -> u64 {
-        self.duration_since(UNIX_EPOCH).unwrap().as_secs()
-    }
-
-    fn elapsed(&self) -> Duration {
-        <SystemTime>::elapsed(self).unwrap()
-    }
 }
 
 #[derive(Debug)]
@@ -120,18 +97,22 @@ impl<T: LenEntry + Send + Sync> LenEntry for Arc<T> {
     }
 }
 
+#[derive(MetricsComponent)]
 struct State<K: Ord + Hash + Eq + Clone + Debug, T: LenEntry + Debug> {
     lru: LruCache<K, EvictionItem<T>>,
     btree: Option<BTreeSet<K>>,
+    #[metric(help = "Total size of all items in the store")]
     sum_store_size: u64,
 
-    // Metrics.
+    #[metric(help = "Number of bytes evicted from the store")]
     evicted_bytes: Counter,
+    #[metric(help = "Number of items evicted from the store")]
     evicted_items: CounterWithTime,
+    #[metric(help = "Number of bytes replaced in the store")]
     replaced_bytes: Counter,
+    #[metric(help = "Number of items replaced in the store")]
     replaced_items: CounterWithTime,
-    removed_bytes: Counter,
-    removed_items: CounterWithTime,
+    #[metric(help = "Number of bytes inserted into the store since it was created")]
     lifetime_inserted_bytes: Counter,
 }
 
@@ -171,12 +152,18 @@ impl<K: Ord + Hash + Eq + Clone + Debug, T: LenEntry + Debug + Sync> State<K, T>
     }
 }
 
+#[derive(MetricsComponent)]
 pub struct EvictingMap<K: Ord + Hash + Eq + Clone + Debug, T: LenEntry + Debug, I: InstantWrapper> {
+    #[metric]
     state: Mutex<State<K, T>>,
     anchor_time: I,
+    #[metric(help = "Maximum size of the store in bytes")]
     max_bytes: u64,
+    #[metric(help = "Number of bytes to evict when the store is full")]
     evict_bytes: u64,
+    #[metric(help = "Maximum number of seconds to keep an item in the store")]
     max_seconds: i32,
+    #[metric(help = "Maximum number of items to keep in the store")]
     max_count: u64,
 }
 
@@ -198,8 +185,6 @@ where
                 evicted_items: CounterWithTime::default(),
                 replaced_bytes: Counter::default(),
                 replaced_items: CounterWithTime::default(),
-                removed_bytes: Counter::default(),
-                removed_items: CounterWithTime::default(),
                 lifetime_inserted_bytes: Counter::default(),
             }),
             anchor_time,
@@ -321,7 +306,7 @@ where
         Q: Ord + Hash + Eq + Debug,
     {
         let mut results = [None];
-        self.sizes_for_keys([key], &mut results[..]).await;
+        self.sizes_for_keys([key], &mut results[..], false).await;
         results[0]
     }
 
@@ -329,8 +314,14 @@ where
     /// to be provided for storing the resulting key sizes. Each index value in
     /// `keys` maps directly to the size value for the key in `results`.
     /// If no key is found in the internal map, `None` is filled in its place.
-    pub async fn sizes_for_keys<It, Q, R>(&self, keys: It, results: &mut [Option<usize>])
-    where
+    /// If `peek` is set to `true`, the items are not promoted to the front of the
+    /// LRU cache. Note: peek may still evict, but won't promote.
+    pub async fn sizes_for_keys<It, Q, R>(
+        &self,
+        keys: It,
+        results: &mut [Option<usize>],
+        peek: bool,
+    ) where
         It: IntoIterator<Item = R>,
         // This may look strange, but what we are doing is saying:
         // * `K` must be able to borrow `Q`
@@ -345,7 +336,12 @@ where
 
         let lru_len = state.lru.len();
         for (key, result) in keys.into_iter().zip(results.iter_mut()) {
-            match state.lru.get(key.borrow()) {
+            let maybe_entry = if peek {
+                state.lru.peek_mut(key.borrow())
+            } else {
+                state.lru.get_mut(key.borrow())
+            };
+            match maybe_entry {
                 Some(entry) => {
                     // Since we are not inserting anythign we don't need to evict based
                     // on the size of the store.
@@ -353,7 +349,10 @@ where
                     // based on the current time. In such case, we remove the item while
                     // we are here.
                     let should_evict = self.should_evict(lru_len, entry, 0, u64::MAX);
-                    if !should_evict && entry.data.touch().await {
+                    if !should_evict && peek {
+                        *result = Some(entry.data.len());
+                    } else if !should_evict && entry.data.touch().await {
+                        entry.seconds_since_anchor = self.anchor_time.elapsed().as_secs() as i32;
                         *result = Some(entry.data.len());
                     } else {
                         *result = None;
@@ -383,6 +382,7 @@ where
         let entry = state.lru.get_mut(key.borrow())?;
 
         if entry.data.touch().await {
+            entry.seconds_since_anchor = self.anchor_time.elapsed().as_secs() as i32;
             return Some(entry.data.clone());
         }
 
@@ -481,113 +481,5 @@ where
             return self.inner_remove(&mut state, key).await;
         }
         false
-    }
-}
-
-impl<K: Ord + Hash + Eq + Clone + Debug, T: LenEntry + Debug, I: InstantWrapper> MetricsComponent
-    for EvictingMap<K, T, I>
-{
-    fn gather_metrics(&self, c: &mut CollectorState) {
-        c.publish(
-            "max_bytes",
-            &self.max_bytes,
-            "Maximum size of the store in bytes",
-        );
-        c.publish(
-            "evict_bytes",
-            &self.evict_bytes,
-            "Number of bytes to evict when the store is full",
-        );
-        c.publish(
-            "anchor_time_timestamp",
-            &self.anchor_time.unix_timestamp(),
-            "Anchor time for the store",
-        );
-        c.publish(
-            "max_seconds",
-            &self.max_seconds,
-            "Maximum number of seconds to keep an item in the store",
-        );
-        c.publish(
-            "max_count",
-            &self.max_count,
-            "Maximum number of items to keep in the store",
-        );
-        futures::executor::block_on(async move {
-            let state = self.state.lock().await;
-            c.publish(
-                "sum_store_size_bytes",
-                &state.sum_store_size,
-                "Total size of all items in the store",
-            );
-            c.publish(
-                "items_in_store_total",
-                &state.lru.len(),
-                "Number of items in the store",
-            );
-            c.publish(
-                "oldest_item_timestamp",
-                &state
-                    .lru
-                    .peek_lru()
-                    .map(|(_, v)| {
-                        self.anchor_time.unix_timestamp() as i64 - v.seconds_since_anchor as i64
-                    })
-                    .unwrap_or(-1),
-                "Timestamp of the oldest item in the store",
-            );
-            c.publish(
-                "newest_item_timestamp",
-                &state
-                    .lru
-                    .iter()
-                    .next()
-                    .map(|(_, v)| {
-                        self.anchor_time.unix_timestamp() as i64 - v.seconds_since_anchor as i64
-                    })
-                    .unwrap_or(-1),
-                "Timestamp of the newest item in the store",
-            );
-            c.publish(
-                "evicted_items_total",
-                &state.evicted_items,
-                "Number of items evicted from the store",
-            );
-            c.publish(
-                "evicted_bytes",
-                &state.evicted_bytes,
-                "Number of bytes evicted from the store",
-            );
-            c.publish(
-                "lifetime_inserted_bytes",
-                &state.lifetime_inserted_bytes,
-                "Number of bytes inserted into the store since it was created",
-            );
-            c.publish(
-                "replaced_bytes",
-                &state.replaced_bytes,
-                "Number of bytes replaced in the store",
-            );
-            c.publish(
-                "replaced_items_total",
-                &state.replaced_items,
-                "Number of items replaced in the store",
-            );
-            c.publish(
-                "removed_bytes",
-                &state.removed_bytes,
-                "Number of bytes explicitly removed from the store",
-            );
-            c.publish(
-                "removed_items_total",
-                &state.removed_items,
-                "Number of items explicitly removed from the store",
-            );
-            c.publish_stats(
-                "item_size_bytes",
-                state.lru.iter().take(1_000_000).map(|(_, v)| v.data.len()),
-                "Stats about the first 1_000_000 items in the store (these are newest items in the store)",
-            );
-        });
     }
 }
