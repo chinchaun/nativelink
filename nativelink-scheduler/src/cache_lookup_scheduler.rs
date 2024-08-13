@@ -13,11 +13,9 @@
 // limitations under the License.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::Future;
 use nativelink_error::{make_err, Code, Error, ResultExt};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_proto::build::bazel::remote::execution::v2::{
@@ -26,12 +24,14 @@ use nativelink_proto::build::bazel::remote::execution::v2::{
 use nativelink_store::ac_utils::get_and_decode_digest;
 use nativelink_store::grpc_store::GrpcStore;
 use nativelink_util::action_messages::{
-    ActionInfo, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier,
-    ClientOperationId, OperationId,
+    ActionInfo, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier, OperationId,
 };
 use nativelink_util::background_spawn;
 use nativelink_util::common::DigestInfo;
 use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::operation_state_manager::{
+    ActionStateResult, ActionStateResultStream, ClientStateManager, OperationFilter,
+};
 use nativelink_util::store_trait::Store;
 use parking_lot::{Mutex, MutexGuard};
 use scopeguard::guard;
@@ -39,7 +39,7 @@ use tokio::sync::oneshot;
 use tonic::Request;
 use tracing::{event, Level};
 
-use crate::action_scheduler::{ActionListener, ActionScheduler};
+use crate::action_scheduler::ActionScheduler;
 use crate::platform_property_manager::PlatformPropertyManager;
 
 /// Actions that are having their cache checked or failed cache lookup and are
@@ -48,8 +48,8 @@ use crate::platform_property_manager::PlatformPropertyManager;
 type CheckActions = HashMap<
     ActionUniqueKey,
     Vec<(
-        ClientOperationId,
-        oneshot::Sender<Result<Pin<Box<dyn ActionListener>>, Error>>,
+        OperationId,
+        oneshot::Sender<Result<Box<dyn ActionStateResult>, Error>>,
     )>,
 >;
 
@@ -92,14 +92,14 @@ async fn get_action_from_store(
     }
 }
 
-/// Future for when ActionListeners are known.
-type ActionListenerOneshot = oneshot::Receiver<Result<Pin<Box<dyn ActionListener>>, Error>>;
+/// Future for when ActionStateResults are known.
+type ActionStateResultOneshot = oneshot::Receiver<Result<Box<dyn ActionStateResult>, Error>>;
 
 fn subscribe_to_existing_action(
     inflight_cache_checks: &mut MutexGuard<CheckActions>,
     unique_qualifier: &ActionUniqueKey,
-    client_operation_id: &ClientOperationId,
-) -> Option<ActionListenerOneshot> {
+    client_operation_id: &OperationId,
+) -> Option<ActionStateResultOneshot> {
     inflight_cache_checks
         .get_mut(unique_qualifier)
         .map(|oneshots| {
@@ -108,20 +108,36 @@ fn subscribe_to_existing_action(
             rx
         })
 }
-struct CachedActionListener {
-    client_operation_id: ClientOperationId,
+
+struct CacheLookupActionStateResult {
     action_state: Arc<ActionState>,
+    change_called: bool,
 }
 
-impl ActionListener for CachedActionListener {
-    fn client_operation_id(&self) -> &ClientOperationId {
-        &self.client_operation_id
+#[async_trait]
+impl ActionStateResult for CacheLookupActionStateResult {
+    async fn as_state(&self) -> Result<Arc<ActionState>, Error> {
+        Ok(self.action_state.clone())
     }
 
-    fn changed(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<ActionState>, Error>> + Send + '_>> {
-        Box::pin(async { Ok(self.action_state.clone()) })
+    async fn changed(&mut self) -> Result<Arc<ActionState>, Error> {
+        if self.change_called {
+            return Err(make_err!(
+                Code::Internal,
+                "CacheLookupActionStateResult::changed called twice"
+            ));
+        }
+        self.change_called = true;
+        Ok(self.action_state.clone())
+    }
+
+    async fn as_action_info(&self) -> Result<Arc<ActionInfo>, Error> {
+        // TODO(allada) We should probably remove as_action_info()
+        // or implement it properly.
+        return Err(make_err!(
+            Code::Unimplemented,
+            "as_action_info not implemented for CacheLookupActionStateResult::as_action_info"
+        ));
     }
 }
 
@@ -133,24 +149,12 @@ impl CacheLookupScheduler {
             inflight_cache_checks: Default::default(),
         })
     }
-}
 
-#[async_trait]
-impl ActionScheduler for CacheLookupScheduler {
-    async fn get_platform_property_manager(
+    async fn inner_add_action(
         &self,
-        instance_name: &str,
-    ) -> Result<Arc<PlatformPropertyManager>, Error> {
-        self.action_scheduler
-            .get_platform_property_manager(instance_name)
-            .await
-    }
-
-    async fn add_action(
-        &self,
-        client_operation_id: ClientOperationId,
-        action_info: ActionInfo,
-    ) -> Result<Pin<Box<dyn ActionListener>>, Error> {
+        client_operation_id: OperationId,
+        action_info: Arc<ActionInfo>,
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
         let unique_key = match &action_info.unique_qualifier {
             ActionUniqueQualifier::Cachable(unique_key) => unique_key.clone(),
             ActionUniqueQualifier::Uncachable(_) => {
@@ -192,7 +196,7 @@ impl ActionScheduler for CacheLookupScheduler {
                 let action_listener = action_listener_fut.await.map_err(|_| {
                     make_err!(
                         Code::Internal,
-                        "ActionListener tx hung up in CacheLookupScheduler::add_action"
+                        "ActionStateResult tx hung up in CacheLookupScheduler::add_action"
                     )
                 })?;
                 return action_listener;
@@ -240,15 +244,18 @@ impl ActionScheduler for CacheLookupScheduler {
                     let Some(pending_txs) = maybe_pending_txs else {
                         return; // Nobody is waiting for this action anymore.
                     };
-                    let action_state = Arc::new(ActionState {
-                        id: OperationId::new(action_info.unique_qualifier.clone()),
+                    let mut action_state = ActionState {
+                        operation_id: OperationId::default(),
                         stage: ActionStage::CompletedFromCache(action_result),
-                    });
+                        action_digest: action_info.unique_qualifier.digest(),
+                    };
+
                     for (client_operation_id, pending_tx) in pending_txs {
+                        action_state.operation_id = client_operation_id;
                         // Ignore errors here, as the other end may have hung up.
-                        let _ = pending_tx.send(Ok(Box::pin(CachedActionListener {
-                            client_operation_id,
-                            action_state: action_state.clone(),
+                        let _ = pending_tx.send(Ok(Box::new(CacheLookupActionStateResult {
+                            action_state: Arc::new(action_state.clone()),
+                            change_called: false,
                         })));
                     }
                     return;
@@ -297,19 +304,51 @@ impl ActionScheduler for CacheLookupScheduler {
             .map_err(|_| {
                 make_err!(
                     Code::Internal,
-                    "ActionListener tx hung up in CacheLookupScheduler::add_action"
+                    "ActionStateResult tx hung up in CacheLookupScheduler::add_action"
                 )
             })?
             .err_tip(|| "In CacheLookupScheduler::add_action")
     }
 
-    async fn find_by_client_operation_id(
+    async fn inner_filter_operations(
         &self,
-        client_operation_id: &ClientOperationId,
-    ) -> Result<Option<Pin<Box<dyn ActionListener>>>, Error> {
+        filter: OperationFilter,
+    ) -> Result<ActionStateResultStream, Error> {
         self.action_scheduler
-            .find_by_client_operation_id(client_operation_id)
+            .filter_operations(filter)
             .await
+            .err_tip(|| "In CacheLookupScheduler::filter_operations")
+    }
+}
+
+#[async_trait]
+impl ActionScheduler for CacheLookupScheduler {
+    async fn get_platform_property_manager(
+        &self,
+        instance_name: &str,
+    ) -> Result<Arc<PlatformPropertyManager>, Error> {
+        self.action_scheduler
+            .get_platform_property_manager(instance_name)
+            .await
+    }
+}
+
+#[async_trait]
+impl ClientStateManager for CacheLookupScheduler {
+    async fn add_action(
+        &self,
+        client_operation_id: OperationId,
+        action_info: Arc<ActionInfo>,
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
+        self.inner_add_action(client_operation_id, action_info)
+            .await
+    }
+
+    async fn filter_operations(
+        &self,
+        filter: OperationFilter,
+    ) -> Result<ActionStateResultStream, Error> {
+        self.inner_filter_operations(filter).await
     }
 }
 

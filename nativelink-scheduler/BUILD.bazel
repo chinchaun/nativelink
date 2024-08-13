@@ -14,7 +14,6 @@ rust_library(
         "src/awaited_action_db/awaited_action.rs",
         "src/awaited_action_db/mod.rs",
         "src/cache_lookup_scheduler.rs",
-        "src/default_action_listener.rs",
         "src/default_scheduler_factory.rs",
         "src/grpc_scheduler.rs",
         "src/lib.rs",
@@ -38,6 +37,7 @@ rust_library(
         "//nativelink-store",
         "//nativelink-util",
         "@crates//:async-lock",
+        "@crates//:bytes",
         "@crates//:futures",
         "@crates//:lru",
         "@crates//:parking_lot",
@@ -83,6 +83,7 @@ rust_test_suite(
         "@crates//:pretty_assertions",
         "@crates//:prost",
         "@crates//:tokio",
+        "@crates//:tokio-stream",
         "@crates//:uuid",
     ],
 )

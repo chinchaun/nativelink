@@ -27,22 +27,21 @@ use nativelink_macro::nativelink_test;
 use nativelink_proto::build::bazel::remote::execution::v2::ActionResult as ProtoActionResult;
 use nativelink_scheduler::action_scheduler::ActionScheduler;
 use nativelink_scheduler::cache_lookup_scheduler::CacheLookupScheduler;
-use nativelink_scheduler::default_action_listener::DefaultActionListener;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_store::memory_store::MemoryStore;
 use nativelink_util::action_messages::{
-    ActionResult, ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier,
-    ClientOperationId, OperationId,
+    ActionResult, ActionStage, ActionState, ActionUniqueQualifier, OperationId,
 };
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::operation_state_manager::{ClientStateManager, OperationFilter};
 use nativelink_util::store_trait::{Store, StoreLike};
 use pretty_assertions::assert_eq;
 use prost::Message;
 use tokio::sync::watch;
 use tokio::{self};
+use tokio_stream::StreamExt;
 use utils::mock_scheduler::MockActionScheduler;
-use utils::scheduler_utils::{make_base_action_info, INSTANCE_NAME};
+use utils::scheduler_utils::{make_base_action_info, TokioWatchActionStateResult, INSTANCE_NAME};
 
 struct TestContext {
     mock_scheduler: Arc<MockActionScheduler>,
@@ -95,23 +94,26 @@ async fn add_action_handles_skip_cache() -> Result<(), Error> {
         .await?;
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let ActionUniqueQualifier::Cachable(action_key) = action_info.unique_qualifier.clone() else {
         panic!("This test should be testing when item was cached first");
     };
-    let mut skip_cache_action = action_info.clone();
+    let mut skip_cache_action = action_info.as_ref().clone();
     skip_cache_action.unique_qualifier = ActionUniqueQualifier::Uncachable(action_key);
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let skip_cache_action = Arc::new(skip_cache_action);
+    let client_operation_id = OperationId::default();
     let _ = join!(
         context
             .cache_scheduler
             .add_action(client_operation_id.clone(), skip_cache_action),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id,
+                action_info,
                 forward_watch_channel_rx
             ))))
     );
@@ -121,21 +123,23 @@ async fn add_action_handles_skip_cache() -> Result<(), Error> {
 #[nativelink_test]
 async fn find_by_client_operation_id_call_passed() -> Result<(), Error> {
     let context = make_cache_scheduler()?;
-    let client_operation_id =
-        ClientOperationId::new(ActionUniqueQualifier::Uncachable(ActionUniqueKey {
-            instance_name: "instance".to_string(),
-            digest_function: DigestHasherFunc::Sha256,
-            digest: DigestInfo::new([8; 32], 1),
-        }));
-    let (actual_result, actual_client_id) = join!(
-        context
-            .cache_scheduler
-            .find_by_client_operation_id(&client_operation_id),
+    let client_operation_id = OperationId::default();
+    let (actual_result, actual_filter) = join!(
+        context.cache_scheduler.filter_operations(OperationFilter {
+            client_operation_id: Some(client_operation_id.clone()),
+            ..Default::default()
+        }),
         context
             .mock_scheduler
-            .expect_find_by_client_operation_id(Ok(None)),
+            .expect_filter_operations(Ok(Box::pin(futures::stream::empty()))),
     );
-    assert_eq!(true, actual_result.unwrap().is_none());
-    assert_eq!(client_operation_id, actual_client_id);
+    assert_eq!(true, actual_result.unwrap().next().await.is_none());
+    assert_eq!(
+        OperationFilter {
+            client_operation_id: Some(client_operation_id),
+            ..Default::default()
+        },
+        actual_filter
+    );
     Ok(())
 }

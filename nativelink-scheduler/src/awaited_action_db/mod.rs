@@ -18,9 +18,10 @@ use std::sync::Arc;
 
 pub use awaited_action::{AwaitedAction, AwaitedActionSortKey};
 use futures::{Future, Stream};
-use nativelink_error::Error;
+use nativelink_error::{make_input_err, Error, ResultExt};
 use nativelink_metric::MetricsComponent;
-use nativelink_util::action_messages::{ActionInfo, ClientOperationId, OperationId};
+use nativelink_util::action_messages::{ActionInfo, ActionStage, OperationId};
+use serde::{Deserialize, Serialize};
 
 mod awaited_action;
 
@@ -33,8 +34,38 @@ pub enum SortedAwaitedActionState {
     Completed,
 }
 
+impl TryFrom<&ActionStage> for SortedAwaitedActionState {
+    type Error = Error;
+    fn try_from(value: &ActionStage) -> Result<Self, Error> {
+        match value {
+            ActionStage::CacheCheck => Ok(Self::CacheCheck),
+            ActionStage::Executing => Ok(Self::Executing),
+            ActionStage::Completed(_) => Ok(Self::Completed),
+            ActionStage::Queued => Ok(Self::Queued),
+            _ => Err(make_input_err!("Invalid State")),
+        }
+    }
+}
+
+impl TryFrom<ActionStage> for SortedAwaitedActionState {
+    type Error = Error;
+    fn try_from(value: ActionStage) -> Result<Self, Error> {
+        Self::try_from(&value)
+    }
+}
+
+impl std::fmt::Display for SortedAwaitedActionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortedAwaitedActionState::CacheCheck => write!(f, "CacheCheck"),
+            SortedAwaitedActionState::Queued => write!(f, "Queued"),
+            SortedAwaitedActionState::Executing => write!(f, "Executing"),
+            SortedAwaitedActionState::Completed => write!(f, "Completed"),
+        }
+    }
+}
 /// A struct pointing to an AwaitedAction that can be sorted.
-#[derive(Debug, Clone, MetricsComponent)]
+#[derive(Debug, Clone, Serialize, Deserialize, MetricsComponent)]
 pub struct SortedAwaitedAction {
     #[metric(help = "The sort key of the AwaitedAction")]
     pub sort_key: AwaitedActionSortKey,
@@ -64,6 +95,48 @@ impl Ord for SortedAwaitedAction {
     }
 }
 
+impl std::fmt::Display for SortedAwaitedAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::write(
+            f,
+            format_args!("{}-{}", self.sort_key.as_u64(), self.operation_id),
+        )
+    }
+}
+
+impl From<&AwaitedAction> for SortedAwaitedAction {
+    fn from(value: &AwaitedAction) -> Self {
+        Self {
+            operation_id: value.operation_id().clone(),
+            sort_key: value.sort_key(),
+        }
+    }
+}
+
+impl From<AwaitedAction> for SortedAwaitedAction {
+    fn from(value: AwaitedAction) -> Self {
+        Self::from(&value)
+    }
+}
+
+impl TryInto<Vec<u8>> for SortedAwaitedAction {
+    type Error = Error;
+    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+        serde_json::to_vec(&self)
+            .map_err(|e| make_input_err!("{}", e.to_string()))
+            .err_tip(|| "In SortedAwaitedAction::TryInto::<Vec<u8>>")
+    }
+}
+
+impl TryFrom<&[u8]> for SortedAwaitedAction {
+    type Error = Error;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        serde_json::from_slice(value)
+            .map_err(|e| make_input_err!("{}", e.to_string()))
+            .err_tip(|| "In AwaitedAction::TryFrom::&[u8]")
+    }
+}
+
 /// Subscriber that can be used to monitor when AwaitedActions change.
 pub trait AwaitedActionSubscriber: Send + Sync + Sized + 'static {
     /// Wait for AwaitedAction to change.
@@ -80,21 +153,19 @@ pub trait AwaitedActionDb: Send + Sync + MetricsComponent + 'static {
     /// Get the AwaitedAction by the client operation id.
     fn get_awaited_action_by_id(
         &self,
-        client_operation_id: &ClientOperationId,
-    ) -> impl Future<Output = Result<Option<Self::Subscriber>, Error>> + Send + Sync;
+        client_operation_id: &OperationId,
+    ) -> impl Future<Output = Result<Option<Self::Subscriber>, Error>> + Send;
 
     /// Get all AwaitedActions. This call should be avoided as much as possible.
     fn get_all_awaited_actions(
         &self,
-    ) -> impl Future<Output = impl Stream<Item = Result<Self::Subscriber, Error>> + Send + Sync>
-           + Send
-           + Sync;
+    ) -> impl Future<Output = impl Stream<Item = Result<Self::Subscriber, Error>> + Send> + Send;
 
     /// Get the AwaitedAction by the operation id.
     fn get_by_operation_id(
         &self,
         operation_id: &OperationId,
-    ) -> impl Future<Output = Result<Option<Self::Subscriber>, Error>> + Send + Sync;
+    ) -> impl Future<Output = Result<Option<Self::Subscriber>, Error>> + Send;
 
     /// Get a range of AwaitedActions of a specific state in sorted order.
     fn get_range_of_actions(
@@ -103,21 +174,19 @@ pub trait AwaitedActionDb: Send + Sync + MetricsComponent + 'static {
         start: Bound<SortedAwaitedAction>,
         end: Bound<SortedAwaitedAction>,
         desc: bool,
-    ) -> impl Future<Output = impl Stream<Item = Result<Self::Subscriber, Error>> + Send + Sync>
-           + Send
-           + Sync;
+    ) -> impl Future<Output = impl Stream<Item = Result<Self::Subscriber, Error>> + Send> + Send;
 
     /// Process a change changed AwaitedAction and notify any listeners.
     fn update_awaited_action(
         &self,
         new_awaited_action: AwaitedAction,
-    ) -> impl Future<Output = Result<(), Error>> + Send + Sync;
+    ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// Add (or join) an action to the AwaitedActionDb and subscribe
     /// to changes.
     fn add_action(
         &self,
-        client_operation_id: ClientOperationId,
+        client_operation_id: OperationId,
         action_info: Arc<ActionInfo>,
-    ) -> impl Future<Output = Result<Self::Subscriber, Error>> + Send + Sync;
+    ) -> impl Future<Output = Result<Self::Subscriber, Error>> + Send;
 }

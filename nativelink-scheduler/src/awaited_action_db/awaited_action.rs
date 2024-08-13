@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use nativelink_error::{make_input_err, Error, ResultExt};
 use nativelink_metric::{
     MetricFieldData, MetricKind, MetricPublishKnownKindData, MetricsComponent,
@@ -86,7 +87,8 @@ impl AwaitedAction {
         );
         let state = Arc::new(ActionState {
             stage,
-            id: operation_id.clone(),
+            operation_id: operation_id.clone(),
+            action_digest: action_info.unique_qualifier.digest(),
         });
         Self {
             version: AwaitedActionVersion(0),
@@ -148,12 +150,13 @@ impl AwaitedAction {
     }
 }
 
-impl TryInto<Vec<u8>> for AwaitedAction {
+impl TryInto<bytes::Bytes> for AwaitedAction {
     type Error = Error;
-    fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-        serde_json::to_vec(&self)
+    fn try_into(self) -> Result<Bytes, Self::Error> {
+        serde_json::to_string(&self)
+            .map(Bytes::from)
             .map_err(|e| make_input_err!("{}", e.to_string()))
-            .err_tip(|| "In AwaitedAction::TryInto::<Vec<u8>>")
+            .err_tip(|| "In AwaitedAction::TryInto::Bytes")
     }
 }
 
@@ -211,6 +214,10 @@ impl AwaitedActionSortKey {
             .unwrap()
             .as_secs() as u32;
         Self::new(priority, timestamp)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
     }
 }
 

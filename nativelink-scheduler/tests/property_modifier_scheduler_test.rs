@@ -21,25 +21,21 @@ mod utils {
     pub(crate) mod scheduler_utils;
 }
 
-use futures::join;
+use futures::{join, StreamExt};
 use nativelink_config::schedulers::{PlatformPropertyAddition, PropertyModification, PropertyType};
 use nativelink_error::Error;
 use nativelink_macro::nativelink_test;
 use nativelink_scheduler::action_scheduler::ActionScheduler;
-use nativelink_scheduler::default_action_listener::DefaultActionListener;
 use nativelink_scheduler::platform_property_manager::PlatformPropertyManager;
 use nativelink_scheduler::property_modifier_scheduler::PropertyModifierScheduler;
-use nativelink_util::action_messages::{
-    ActionStage, ActionState, ActionUniqueKey, ActionUniqueQualifier, ClientOperationId,
-    OperationId,
-};
+use nativelink_util::action_messages::{ActionStage, ActionState, OperationId};
 use nativelink_util::common::DigestInfo;
-use nativelink_util::digest_hasher::DigestHasherFunc;
+use nativelink_util::operation_state_manager::{ClientStateManager, OperationFilter};
 use nativelink_util::platform_properties::PlatformPropertyValue;
 use pretty_assertions::assert_eq;
 use tokio::sync::watch;
 use utils::mock_scheduler::MockActionScheduler;
-use utils::scheduler_utils::{make_base_action_info, INSTANCE_NAME};
+use utils::scheduler_utils::{make_base_action_info, TokioWatchActionStateResult, INSTANCE_NAME};
 
 struct TestContext {
     mock_scheduler: Arc<MockActionScheduler>,
@@ -73,25 +69,27 @@ async fn add_action_adds_property() -> Result<(), Error> {
     let action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::from([(
         name.clone(),
         PropertyType::exact,
     )])));
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let client_operation_id = OperationId::default();
     let (_, _, (passed_client_operation_id, action_info)) = join!(
         context
             .modifier_scheduler
-            .add_action(client_operation_id.clone(), action_info),
+            .add_action(client_operation_id.clone(), action_info.clone()),
         context
             .mock_scheduler
             .expect_get_platform_property_manager(Ok(platform_property_manager)),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id.clone(),
+                action_info,
                 forward_watch_channel_rx
             )))),
     );
@@ -113,32 +111,37 @@ async fn add_action_overwrites_property() -> Result<(), Error> {
             name: name.clone(),
             value: replaced_value.clone(),
         })]);
-    let mut action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+    let mut action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest())
+        .as_ref()
+        .clone();
     action_info
         .platform_properties
         .properties
         .insert(name.clone(), PlatformPropertyValue::Unknown(original_value));
+    let action_info = Arc::new(action_info);
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::from([(
         name.clone(),
         PropertyType::exact,
     )])));
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let client_operation_id = OperationId::default();
     let (_, _, (passed_client_operation_id, action_info)) = join!(
         context
             .modifier_scheduler
-            .add_action(client_operation_id.clone(), action_info),
+            .add_action(client_operation_id.clone(), action_info.clone()),
         context
             .mock_scheduler
             .expect_get_platform_property_manager(Ok(platform_property_manager)),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id.clone(),
+                action_info,
                 forward_watch_channel_rx
             )))),
     );
@@ -164,25 +167,27 @@ async fn add_action_property_added_after_remove() -> Result<(), Error> {
     let action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::from([(
         name.clone(),
         PropertyType::exact,
     )])));
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let client_operation_id = OperationId::default();
     let (_, _, (passed_client_operation_id, action_info)) = join!(
         context
             .modifier_scheduler
-            .add_action(client_operation_id.clone(), action_info),
+            .add_action(client_operation_id.clone(), action_info.clone()),
         context
             .mock_scheduler
             .expect_get_platform_property_manager(Ok(platform_property_manager)),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id.clone(),
+                action_info,
                 forward_watch_channel_rx
             )))),
     );
@@ -208,25 +213,27 @@ async fn add_action_property_remove_after_add() -> Result<(), Error> {
     let action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::from([(
         name,
         PropertyType::exact,
     )])));
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let client_operation_id = OperationId::default();
     let (_, _, (passed_client_operation_id, action_info)) = join!(
         context
             .modifier_scheduler
-            .add_action(client_operation_id.clone(), action_info),
+            .add_action(client_operation_id.clone(), action_info.clone()),
         context
             .mock_scheduler
             .expect_get_platform_property_manager(Ok(platform_property_manager)),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id.clone(),
+                action_info,
                 forward_watch_channel_rx
             )))),
     );
@@ -243,29 +250,34 @@ async fn add_action_property_remove() -> Result<(), Error> {
     let name = "name".to_string();
     let value = "value".to_string();
     let context = make_modifier_scheduler(vec![PropertyModification::remove(name.clone())]);
-    let mut action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+    let mut action_info = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest())
+        .as_ref()
+        .clone();
     action_info
         .platform_properties
         .properties
         .insert(name, PlatformPropertyValue::Unknown(value));
+    let action_info = Arc::new(action_info);
     let (_forward_watch_channel_tx, forward_watch_channel_rx) =
         watch::channel(Arc::new(ActionState {
-            id: OperationId::new(action_info.unique_qualifier.clone()),
+            operation_id: OperationId::default(),
             stage: ActionStage::Queued,
+            action_digest: action_info.unique_qualifier.digest(),
         }));
     let platform_property_manager = Arc::new(PlatformPropertyManager::new(HashMap::new()));
-    let client_operation_id = ClientOperationId::new(action_info.unique_qualifier.clone());
+    let client_operation_id = OperationId::default();
     let (_, _, (passed_client_operation_id, action_info)) = join!(
         context
             .modifier_scheduler
-            .add_action(client_operation_id.clone(), action_info),
+            .add_action(client_operation_id.clone(), action_info.clone()),
         context
             .mock_scheduler
             .expect_get_platform_property_manager(Ok(platform_property_manager)),
         context
             .mock_scheduler
-            .expect_add_action(Ok(Box::pin(DefaultActionListener::new(
+            .expect_add_action(Ok(Box::new(TokioWatchActionStateResult::new(
                 client_operation_id.clone(),
+                action_info,
                 forward_watch_channel_rx
             )))),
     );
@@ -280,21 +292,26 @@ async fn add_action_property_remove() -> Result<(), Error> {
 #[nativelink_test]
 async fn find_by_client_operation_id_call_passed() -> Result<(), Error> {
     let context = make_modifier_scheduler(vec![]);
-    let operation_id = ClientOperationId::new(ActionUniqueQualifier::Uncachable(ActionUniqueKey {
-        instance_name: "instance".to_string(),
-        digest_function: DigestHasherFunc::Sha256,
-        digest: DigestInfo::new([8; 32], 1),
-    }));
-    let (actual_result, actual_operation_id) = join!(
+    let client_operation_id = OperationId::default();
+    let (actual_result, actual_filter) = join!(
         context
             .modifier_scheduler
-            .find_by_client_operation_id(&operation_id),
+            .filter_operations(OperationFilter {
+                client_operation_id: Some(client_operation_id.clone()),
+                ..Default::default()
+            }),
         context
             .mock_scheduler
-            .expect_find_by_client_operation_id(Ok(None)),
+            .expect_filter_operations(Ok(Box::pin(futures::stream::empty()))),
     );
-    assert_eq!(true, actual_result.unwrap().is_none());
-    assert_eq!(operation_id, actual_operation_id);
+    assert_eq!(true, actual_result.unwrap().next().await.is_none());
+    assert_eq!(
+        OperationFilter {
+            client_operation_id: Some(client_operation_id),
+            ..Default::default()
+        },
+        actual_filter
+    );
     Ok(())
 }
 

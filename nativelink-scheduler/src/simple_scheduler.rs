@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -22,7 +21,7 @@ use nativelink_config::stores::EvictionPolicy;
 use nativelink_error::{Error, ResultExt};
 use nativelink_metric::{MetricsComponent, RootMetricsComponent};
 use nativelink_util::action_messages::{
-    ActionInfo, ActionStage, ActionState, ClientOperationId, OperationId, WorkerId,
+    ActionInfo, ActionStage, ActionState, OperationId, WorkerId,
 };
 use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::operation_state_manager::{
@@ -36,7 +35,7 @@ use tokio::time::Duration;
 use tokio_stream::StreamExt;
 use tracing::{event, Level};
 
-use crate::action_scheduler::{ActionListener, ActionScheduler};
+use crate::action_scheduler::ActionScheduler;
 use crate::api_worker_scheduler::ApiWorkerScheduler;
 use crate::memory_awaited_action_db::MemoryAwaitedActionDb;
 use crate::platform_property_manager::PlatformPropertyManager;
@@ -56,14 +55,14 @@ const DEFAULT_RETAIN_COMPLETED_FOR_S: u32 = 60;
 /// If this changes, remember to change the documentation in the config.
 const DEFAULT_MAX_JOB_RETRIES: usize = 3;
 
-struct SimpleSchedulerActionListener {
-    client_operation_id: ClientOperationId,
+struct SimpleSchedulerActionStateResult {
+    client_operation_id: OperationId,
     action_state_result: Box<dyn ActionStateResult>,
 }
 
-impl SimpleSchedulerActionListener {
+impl SimpleSchedulerActionStateResult {
     fn new(
-        client_operation_id: ClientOperationId,
+        client_operation_id: OperationId,
         action_state_result: Box<dyn ActionStateResult>,
     ) -> Self {
         Self {
@@ -73,22 +72,37 @@ impl SimpleSchedulerActionListener {
     }
 }
 
-impl ActionListener for SimpleSchedulerActionListener {
-    fn client_operation_id(&self) -> &ClientOperationId {
-        &self.client_operation_id
+#[async_trait]
+impl ActionStateResult for SimpleSchedulerActionStateResult {
+    async fn as_state(&self) -> Result<Arc<ActionState>, Error> {
+        let mut action_state = self
+            .action_state_result
+            .as_state()
+            .await
+            .err_tip(|| "In SimpleSchedulerActionStateResult")?;
+        // We need to ensure the client is not aware of the downstream
+        // operation id, so override it before it goes out.
+        Arc::make_mut(&mut action_state).operation_id = self.client_operation_id.clone();
+        Ok(action_state)
     }
 
-    fn changed(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Arc<ActionState>, Error>> + Send + '_>> {
-        Box::pin(async move {
-            let action_state = self
-                .action_state_result
-                .changed()
-                .await
-                .err_tip(|| "In SimpleSchedulerActionListener::changed getting receiver")?;
-            Ok(action_state)
-        })
+    async fn changed(&mut self) -> Result<Arc<ActionState>, Error> {
+        let mut action_state = self
+            .action_state_result
+            .changed()
+            .await
+            .err_tip(|| "In SimpleSchedulerActionStateResult")?;
+        // We need to ensure the client is not aware of the downstream
+        // operation id, so override it before it goes out.
+        Arc::make_mut(&mut action_state).operation_id = self.client_operation_id.clone();
+        Ok(action_state)
+    }
+
+    async fn as_action_info(&self) -> Result<Arc<ActionInfo>, Error> {
+        self.action_state_result
+            .as_action_info()
+            .await
+            .err_tip(|| "In SimpleSchedulerActionStateResult")
     }
 }
 
@@ -125,41 +139,30 @@ impl SimpleScheduler {
     /// for execution based on priority and other metrics.
     /// All further updates to the action will be provided through the returned
     /// value.
-    async fn add_action(
+    async fn inner_add_action(
         &self,
-        client_operation_id: ClientOperationId,
+        client_operation_id: OperationId,
         action_info: Arc<ActionInfo>,
-    ) -> Result<Pin<Box<dyn ActionListener>>, Error> {
-        let add_action_result = self
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
+        let action_state_result = self
             .client_state_manager
             .add_action(client_operation_id.clone(), action_info)
-            .await?;
-
-        Ok(Box::pin(SimpleSchedulerActionListener::new(
-            client_operation_id,
-            add_action_result,
+            .await
+            .err_tip(|| "In SimpleScheduler::add_action")?;
+        Ok(Box::new(SimpleSchedulerActionStateResult::new(
+            client_operation_id.clone(),
+            action_state_result,
         )))
     }
 
-    async fn find_by_client_operation_id(
+    async fn inner_filter_operations(
         &self,
-        client_operation_id: &ClientOperationId,
-    ) -> Result<Option<Pin<Box<dyn ActionListener>>>, Error> {
-        let filter = OperationFilter {
-            client_operation_id: Some(client_operation_id.clone()),
-            ..Default::default()
-        };
-        let filter_result = self.client_state_manager.filter_operations(filter).await;
-
-        let mut stream = filter_result
-            .err_tip(|| "In SimpleScheduler::find_by_client_operation_id getting filter result")?;
-        let Some(action_state_result) = stream.next().await else {
-            return Ok(None);
-        };
-        Ok(Some(Box::pin(SimpleSchedulerActionListener::new(
-            client_operation_id.clone(),
-            action_state_result,
-        ))))
+        filter: OperationFilter,
+    ) -> Result<ActionStateResultStream, Error> {
+        self.client_state_manager
+            .filter_operations(filter)
+            .await
+            .err_tip(|| "In SimpleScheduler::find_by_client_operation_id getting filter result")
     }
 
     async fn get_queued_operations(&self) -> Result<ActionStateResultStream, Error> {
@@ -205,7 +208,7 @@ impl SimpleScheduler {
                     .as_state()
                     .await
                     .err_tip(|| "Failed to get action_info from as_state_result stream")?;
-                action_state.id.clone()
+                action_state.operation_id.clone()
             };
 
             // Tell the matching engine that the operation is being assigned to a worker.
@@ -356,34 +359,31 @@ impl SimpleScheduler {
 }
 
 #[async_trait]
+impl ClientStateManager for SimpleScheduler {
+    async fn add_action(
+        &self,
+        client_operation_id: OperationId,
+        action_info: Arc<ActionInfo>,
+    ) -> Result<Box<dyn ActionStateResult>, Error> {
+        self.inner_add_action(client_operation_id, action_info)
+            .await
+    }
+
+    async fn filter_operations<'a>(
+        &'a self,
+        filter: OperationFilter,
+    ) -> Result<ActionStateResultStream<'a>, Error> {
+        self.inner_filter_operations(filter).await
+    }
+}
+
+#[async_trait]
 impl ActionScheduler for SimpleScheduler {
     async fn get_platform_property_manager(
         &self,
         _instance_name: &str,
     ) -> Result<Arc<PlatformPropertyManager>, Error> {
         Ok(self.platform_property_manager.clone())
-    }
-
-    async fn add_action(
-        &self,
-        client_operation_id: ClientOperationId,
-        action_info: ActionInfo,
-    ) -> Result<Pin<Box<dyn ActionListener>>, Error> {
-        self.add_action(client_operation_id, Arc::new(action_info))
-            .await
-    }
-
-    async fn find_by_client_operation_id(
-        &self,
-        client_operation_id: &ClientOperationId,
-    ) -> Result<Option<Pin<Box<dyn ActionListener>>>, Error> {
-        let maybe_receiver = self
-            .find_by_client_operation_id(client_operation_id)
-            .await
-            .err_tip(|| {
-                format!("Error while finding action with client id: {client_operation_id:?}")
-            })?;
-        Ok(maybe_receiver)
     }
 }
 
