@@ -20,7 +20,7 @@ jobs:
         image: [image]
         # image: [image, nativelink-worker-init, nativelink-worker-lre-cc]
     name: Publish ${{ matrix.image }}
-    runs-on: ubuntu-22.04
+    runs-on: open-fire-ubuntu-22-04-8vcpu-x86_64
     permissions:
       packages: write
       id-token: write
