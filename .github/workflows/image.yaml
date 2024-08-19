@@ -2,9 +2,9 @@
 name: Create OCI image
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "test-ci" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "test-ci" ]
 
 permissions: read-all
 
@@ -44,18 +44,18 @@ jobs:
         run: |
           nix run .#local-image-test ${{ matrix.image }}
 
-      - name: Upload image
-        run: |
-          nix run .#publish-ghcr ${{ matrix.image }}
-        env:
-          GHCR_REGISTRY: ghcr.io/${{ github.repository_owner }}
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        if: github.ref == 'refs/heads/main'
+      # - name: Upload image
+      #   run: |
+      #     nix run .#publish-ghcr ${{ matrix.image }}
+      #   env:
+      #     GHCR_REGISTRY: ghcr.io/${{ github.repository_owner }}
+      #     GHCR_USERNAME: ${{ github.actor }}
+      #     GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      #   if: github.ref == 'refs/heads/main'
 
-      - name: Upload trivy scan results to GitHub Security tab
-        uses: >- # v2.16.3
-          github/codeql-action/upload-sarif@592977e6ae857384aa79bb31e7a1d62d63449ec5
-        with:
-          sarif_file: 'trivy-results.sarif'
-        if: github.ref == 'refs/heads/main'
+      # - name: Upload trivy scan results to GitHub Security tab
+      #   uses: >- # v2.16.3
+      #     github/codeql-action/upload-sarif@592977e6ae857384aa79bb31e7a1d62d63449ec5
+      #   with:
+      #     sarif_file: 'trivy-results.sarif'
+      #   if: github.ref == 'refs/heads/main'
