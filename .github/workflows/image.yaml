@@ -44,6 +44,8 @@ jobs:
         run: |
           nix run .#local-image-test ${{ matrix.image }}
 
+
+
       # - name: Upload image
       #   run: |
       #     nix run .#publish-ghcr ${{ matrix.image }}
